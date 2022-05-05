@@ -210,11 +210,10 @@ public class Executor {
     _minExecutionProgressCheckIntervalMs = config.getLong(ExecutorConfig.MIN_EXECUTION_PROGRESS_CHECK_INTERVAL_MS_CONFIG);
     _slowTaskAlertingBackoffTimeMs = config.getLong(ExecutorConfig.SLOW_TASK_ALERTING_BACKOFF_TIME_MS_CONFIG);
     _concurrencyAdjusterEnabled = new ConcurrentHashMap<>(ConcurrencyType.cachedValues().size());
-    boolean allEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_ENABLED_CONFIG);
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTER_BROKER_REPLICA,
-                                    allEnabled || config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_INTER_BROKER_REPLICA_ENABLED_CONFIG));
+                                    config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_INTER_BROKER_REPLICA_ENABLED_CONFIG));
     _concurrencyAdjusterEnabled.put(ConcurrencyType.LEADERSHIP,
-                                    allEnabled || config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_LEADERSHIP_ENABLED_CONFIG));
+                                    config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_LEADERSHIP_ENABLED_CONFIG));
     // Support for intra-broker replica movement is pending https://github.com/linkedin/cruise-control/issues/1299.
     _concurrencyAdjusterEnabled.put(ConcurrencyType.INTRA_BROKER_REPLICA, false);
     _concurrencyAdjusterMinIsrCheckEnabled = config.getBoolean(ExecutorConfig.CONCURRENCY_ADJUSTER_MIN_ISR_CHECK_ENABLED_CONFIG);
@@ -558,6 +557,8 @@ public class Executor {
    *                                                         per broker(if null, use num.concurrent.partition.movements.per.broker).
    * @param requestedIntraBrokerPartitionMovementConcurrency The maximum number of concurrent intra-broker partition movements
    *                                                         (if null, use num.concurrent.intra.broker.partition.movements).
+   * @param requestedMaxClusterPartitionMovements The upper bound of concurrent inter broker partition movements in cluster
+   *                                              (if null, use max.num.cluster.partition.movements).
    * @param requestedLeadershipMovementConcurrency The maximum number of concurrent leader movements
    *                                               (if null, use num.concurrent.leader.movements).
    * @param requestedExecutionProgressCheckIntervalMs The interval between checking and updating the progress of an initiated
@@ -576,6 +577,7 @@ public class Executor {
                                             Set<Integer> removedBrokers,
                                             LoadMonitor loadMonitor,
                                             Integer requestedInterBrokerPartitionMovementConcurrency,
+                                            Integer requestedMaxClusterPartitionMovements,
                                             Integer requestedIntraBrokerPartitionMovementConcurrency,
                                             Integer requestedLeadershipMovementConcurrency,
                                             Long requestedExecutionProgressCheckIntervalMs,
@@ -589,7 +591,7 @@ public class Executor {
     sanityCheckExecuteProposals(loadMonitor, uuid);
     _skipInterBrokerReplicaConcurrencyAdjustment = skipInterBrokerReplicaConcurrencyAdjustment;
     try {
-      initProposalExecution(proposals, unthrottledBrokers, requestedInterBrokerPartitionMovementConcurrency,
+      initProposalExecution(proposals, unthrottledBrokers, requestedInterBrokerPartitionMovementConcurrency, requestedMaxClusterPartitionMovements,
                             requestedIntraBrokerPartitionMovementConcurrency, requestedLeadershipMovementConcurrency,
                             requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy, isTriggeredByUserRequest, loadMonitor);
       startExecution(loadMonitor, null, removedBrokers, replicationThrottle, isTriggeredByUserRequest);
@@ -619,6 +621,7 @@ public class Executor {
   private synchronized void initProposalExecution(Collection<ExecutionProposal> proposals,
                                                   Collection<Integer> brokersToSkipConcurrencyCheck,
                                                   Integer requestedInterBrokerPartitionMovementConcurrency,
+                                                  Integer requestedMaxInterBrokerPartitionMovements,
                                                   Integer requestedIntraBrokerPartitionMovementConcurrency,
                                                   Integer requestedLeadershipMovementConcurrency,
                                                   Long requestedExecutionProgressCheckIntervalMs,
@@ -634,6 +637,7 @@ public class Executor {
     _executionTaskManager.addExecutionProposals(proposals, brokersToSkipConcurrencyCheck, strategyOptions, replicaMovementStrategy);
     _concurrencyAdjuster.initAdjustment(loadMonitor, requestedInterBrokerPartitionMovementConcurrency, requestedLeadershipMovementConcurrency);
     setRequestedIntraBrokerPartitionMovementConcurrency(requestedIntraBrokerPartitionMovementConcurrency);
+    setRequestedMaxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements);
     setRequestedExecutionProgressCheckIntervalMs(requestedExecutionProgressCheckIntervalMs);
   }
 
@@ -668,7 +672,7 @@ public class Executor {
     sanityCheckExecuteProposals(loadMonitor, uuid);
     _skipInterBrokerReplicaConcurrencyAdjustment = true;
     try {
-      initProposalExecution(proposals, demotedBrokers, concurrentSwaps, 0, requestedLeadershipMovementConcurrency,
+      initProposalExecution(proposals, demotedBrokers, concurrentSwaps, null, 0, requestedLeadershipMovementConcurrency,
                             requestedExecutionProgressCheckIntervalMs, replicaMovementStrategy, isTriggeredByUserRequest, loadMonitor);
       startExecution(loadMonitor, demotedBrokers, null, replicationThrottle, isTriggeredByUserRequest);
     } catch (Exception e) {
@@ -703,6 +707,16 @@ public class Executor {
    */
   public void setRequestedLeadershipMovementConcurrency(Integer requestedLeadershipMovementConcurrency) {
     _executionTaskManager.setRequestedLeadershipMovementConcurrency(requestedLeadershipMovementConcurrency);
+  }
+
+  /**
+   * Dynamically set the max inter-broker partition movements per cluster.
+   *
+   * @param requestedMaxInterBrokerPartitionMovements The maximum number of concurrent inter-broker partition movements
+   *                                                         per cluster.
+   */
+  public void setRequestedMaxInterBrokerPartitionMovements(Integer requestedMaxInterBrokerPartitionMovements) {
+    _executionTaskManager.setRequestedMaxInterBrokerPartitionMovements(requestedMaxInterBrokerPartitionMovements);
   }
 
   /**
@@ -1368,7 +1382,7 @@ public class Executor {
         Map<ExecutionTaskState, Integer> partitionMovementTasksByState = executionTasksSummary.taskStat().get(INTER_BROKER_REPLICA_ACTION);
         LOG.info("Inter-broker partition movements stopped. For inter-broker partition movements {} tasks cancelled, {} tasks in-progress, "
                  + "{} tasks aborting, {} tasks aborted, {} tasks dead, {} tasks completed, {} remaining data to move; for intra-broker "
-                 + "partition movement {} tasks cancelled; for leadership movements {} task cancelled.",
+                 + "partition movement {} tasks cancelled; for leadership movements {} tasks cancelled.",
                  partitionMovementTasksByState.get(ExecutionTaskState.PENDING),
                  partitionMovementTasksByState.get(ExecutionTaskState.IN_PROGRESS),
                  partitionMovementTasksByState.get(ExecutionTaskState.ABORTING),
@@ -1424,7 +1438,7 @@ public class Executor {
         Map<ExecutionTaskState, Integer> partitionMovementTasksByState = executionTasksSummary.taskStat().get(INTRA_BROKER_REPLICA_ACTION);
         LOG.info("Intra-broker partition movements stopped. For intra-broker partition movements {} tasks cancelled, {} tasks in-progress, "
                  + "{} tasks aborting, {} tasks aborted, {} tasks dead, {} tasks completed, {} remaining data to move; for leadership "
-                 + "movements {} task cancelled.",
+                 + "movements {} tasks cancelled.",
                  partitionMovementTasksByState.get(ExecutionTaskState.PENDING),
                  partitionMovementTasksByState.get(ExecutionTaskState.IN_PROGRESS),
                  partitionMovementTasksByState.get(ExecutionTaskState.ABORTING),
@@ -1845,18 +1859,19 @@ public class Executor {
      *             corresponding inter-broker replica reassignment tasks.
      */
     private void maybeReexecuteInterBrokerReplicaTasks(Set<TopicPartition> deleted, Set<TopicPartition> dead) {
-      List<ExecutionTask> interBrokerReplicaTasksToReexecute =
+      List<ExecutionTask> candidateInterBrokerReplicaTasksToReexecute =
           new ArrayList<>(_executionTaskManager.inExecutionTasks(Collections.singleton(INTER_BROKER_REPLICA_ACTION)));
-      boolean shouldReexecute = false;
+      List<ExecutionTask> tasksToReexecute;
       try {
-        shouldReexecute = !ExecutionUtils.isSubset(ExecutionUtils.partitionsBeingReassigned(_adminClient), interBrokerReplicaTasksToReexecute);
+        tasksToReexecute = ExecutionUtils.getInterBrokerReplicaTasksToReexecute(ExecutionUtils.partitionsBeingReassigned(_adminClient),
+            candidateInterBrokerReplicaTasksToReexecute);
       } catch (TimeoutException | InterruptedException | ExecutionException e) {
         // This may indicate transient (e.g. network) issues.
         LOG.warn("Failed to retrieve partitions being reassigned. Skipping reexecution check for inter-broker replica actions.", e);
+        tasksToReexecute = Collections.emptyList();
       }
-      if (shouldReexecute) {
-        LOG.info("Reexecuting tasks {}", interBrokerReplicaTasksToReexecute);
-        AlterPartitionReassignmentsResult result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, interBrokerReplicaTasksToReexecute);
+      if (!tasksToReexecute.isEmpty()) {
+        AlterPartitionReassignmentsResult result = ExecutionUtils.submitReplicaReassignmentTasks(_adminClient, tasksToReexecute);
         // Process the partition reassignment result.
         Set<TopicPartition> noReassignmentToCancel = new HashSet<>();
         ExecutionUtils.processAlterPartitionReassignmentsResult(result, deleted, dead, noReassignmentToCancel);
